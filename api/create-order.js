@@ -7,10 +7,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   const isProd = process.env.VERCEL_ENV === "production";
-
-  const mollieKey = isProd
-    ? process.env.MOLLIE_LIVE_KEY
-    : process.env.MOLLIE_TEST_KEY;
+  const mollieKey = isProd ? process.env.MOLLIE_LIVE_KEY : process.env.MOLLIE_TEST_KEY;
 
   if (!mollieKey) {
     return res.status(500).json({
@@ -42,14 +39,14 @@ export default async function handler(req, res) {
     });
   }
 
-  // Preise (Netto)
+  // Netto-Preise
   const PRODUCTS = {
     coin: { name: "Münzzähler", net: 1660.0 },
     coin_bill: { name: "Münz & Scheinzähler", net: 1890.0 }
   };
 
-  const vatRate = 0.19;
   const selected = PRODUCTS[productOption];
+  const vatRate = 0.19;
 
   const gross = +(selected.net * (1 + vatRate)).toFixed(2);
   const grossStr = gross.toFixed(2);
@@ -90,13 +87,8 @@ export default async function handler(req, res) {
       city,
       country
     },
-
-    // ✅ Deine Live-Domain
     redirectUrl: "https://boxautomat.shop/zahlung-erfolg",
-
-    // ✅ Webhook bleibt deine Vercel-API
     webhookUrl: "https://boxplanet.vercel.app/api/mollie-webhook",
-
     metadata: {
       env: isProd ? "live" : "test",
       email,
@@ -123,9 +115,7 @@ export default async function handler(req, res) {
     }
 
     const checkoutUrl = data?._links?.checkout?.href;
-    if (!checkoutUrl) {
-      return res.status(500).json({ error: "No checkoutUrl returned", data });
-    }
+    if (!checkoutUrl) return res.status(500).json({ error: "No checkoutUrl returned", data });
 
     return res.status(200).json({
       checkoutUrl,
