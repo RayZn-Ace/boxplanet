@@ -6,8 +6,19 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
-  const key = process.env.MOLLIE_TEST_KEY;
-  if (!key) return res.status(500).json({ error: "MOLLIE_TEST_KEY missing" });
+  const isProd = process.env.VERCEL_ENV === "production";
+
+  const mollieKey = isProd
+    ? process.env.MOLLIE_LIVE_KEY
+    : process.env.MOLLIE_TEST_KEY;
+
+  if (!mollieKey) {
+    return res.status(500).json({
+      error: "Missing Mollie key",
+      expected: isProd ? "MOLLIE_LIVE_KEY" : "MOLLIE_TEST_KEY",
+      vercelEnv: process.env.VERCEL_ENV
+    });
+  }
 
   const {
     firstName,
@@ -17,7 +28,7 @@ export default async function handler(req, res) {
     postalCode,
     city,
     country = "DE",
-    productOption // <-- NEU: "coin" oder "coin_bill"
+    productOption
   } = req.body || {};
 
   if (!firstName || !lastName || !email || !streetAndNumber || !postalCode || !city) {
@@ -31,26 +42,18 @@ export default async function handler(req, res) {
     });
   }
 
-  // --- Preise (Netto) ---
+  // Preise (Netto)
   const PRODUCTS = {
-    coin: {
-      name: "Münzzähler",
-      net: 1660.0
-    },
-    coin_bill: {
-      name: "Münz & Scheinzähler",
-      net: 1890.0
-    }
+    coin: { name: "Münzzähler", net: 1660.0 },
+    coin_bill: { name: "Münz & Scheinzähler", net: 1890.0 }
   };
 
-  const vatRate = 0.19; // 19% DE
+  const vatRate = 0.19;
   const selected = PRODUCTS[productOption];
 
-  // Brutto für Ratenzahlung (Netto + 19%)
   const gross = +(selected.net * (1 + vatRate)).toFixed(2);
-
-  // Mollie values müssen Strings mit 2 Dezimalstellen sein
   const grossStr = gross.toFixed(2);
+
   const vatAmount = +(gross - selected.net).toFixed(2);
   const vatAmountStr = vatAmount.toFixed(2);
 
@@ -63,7 +66,6 @@ export default async function handler(req, res) {
         type: "physical",
         name: `${selected.name} – Boxautomat`,
         quantity: 1,
-        // Für Mollie Orders mit VAT ist es sauber, Gross/Net zu trennen:
         unitPrice: { currency: "EUR", value: grossStr },
         totalAmount: { currency: "EUR", value: grossStr },
         vatRate: "19.00",
@@ -88,9 +90,15 @@ export default async function handler(req, res) {
       city,
       country
     },
+
+    // ✅ Deine Live-Domain
     redirectUrl: "https://boxautomat.shop/zahlung-erfolg",
+
+    // ✅ Webhook bleibt deine Vercel-API
     webhookUrl: "https://boxplanet.vercel.app/api/mollie-webhook",
+
     metadata: {
+      env: isProd ? "live" : "test",
       email,
       productOption,
       net: selected.net,
@@ -102,7 +110,7 @@ export default async function handler(req, res) {
     const response = await fetch("https://api.mollie.com/v2/orders", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${key}`,
+        Authorization: `Bearer ${mollieKey}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify(payload)
@@ -119,7 +127,12 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "No checkoutUrl returned", data });
     }
 
-    return res.status(200).json({ checkoutUrl, orderId: data.id, amountGross: grossStr });
+    return res.status(200).json({
+      checkoutUrl,
+      orderId: data.id,
+      amountGross: grossStr,
+      env: isProd ? "live" : "test"
+    });
   } catch (err) {
     return res.status(500).json({ error: "Server error", details: String(err) });
   }
