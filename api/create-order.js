@@ -14,10 +14,40 @@ const clampQuantity = (q) => {
 const toEurString = (cents) => (cents / 100).toFixed(2);
 
 module.exports = async (req, res) => {
+  /* =========================
+     CORS FIX
+  ========================== */
+
+  const origin = req.headers.origin || "";
+
+  const allowedOrigins = [
+    "https://boxplanet.shop",
+    "https://www.boxplanet.shop",
+    "http://localhost:3000"
+  ];
+
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    return res.end();
+  }
+
   if (req.method !== "POST") {
     res.statusCode = 405;
     return res.json({ error: "Method not allowed" });
   }
+
+  /* =========================
+     START ORDER LOGIC
+  ========================== */
 
   try {
     if (!process.env.MOLLIE_API_KEY) {
@@ -25,9 +55,12 @@ module.exports = async (req, res) => {
       return res.json({ error: "Missing MOLLIE_API_KEY" });
     }
 
-    const mollie = createMollieClient({ apiKey: process.env.MOLLIE_API_KEY });
+    const mollie = createMollieClient({
+      apiKey: process.env.MOLLIE_API_KEY,
+    });
 
     const body = req.body || {};
+
     const {
       firstName,
       lastName,
@@ -49,18 +82,27 @@ module.exports = async (req, res) => {
     const normalizedItems = [];
 
     if (Array.isArray(cart) && cart.length > 0) {
-      for (const it of cart) {
-        const option = String(it.productOption || "").trim();
+      for (const item of cart) {
+        const option = String(item.productOption || "").trim();
         if (!option || !PRODUCT_CATALOG[option]) continue;
-        normalizedItems.push({ option, qty: clampQuantity(it.quantity) });
+
+        normalizedItems.push({
+          option,
+          qty: clampQuantity(item.quantity),
+        });
       }
     } else {
       const option = String(productOption || "").trim();
+
       if (!option || !PRODUCT_CATALOG[option]) {
         res.statusCode = 400;
         return res.json({ error: "Invalid productOption" });
       }
-      normalizedItems.push({ option, qty: clampQuantity(quantity) });
+
+      normalizedItems.push({
+        option,
+        qty: clampQuantity(quantity),
+      });
     }
 
     if (normalizedItems.length === 0) {
@@ -68,9 +110,9 @@ module.exports = async (req, res) => {
       return res.json({ error: "No valid cart items" });
     }
 
-    const totalNetCents = normalizedItems.reduce((sum, it) => {
-      const p = PRODUCT_CATALOG[it.option];
-      return sum + p.unitPriceNetCents * it.qty;
+    const totalNetCents = normalizedItems.reduce((sum, item) => {
+      const product = PRODUCT_CATALOG[item.option];
+      return sum + product.unitPriceNetCents * item.qty;
     }, 0);
 
     if (!Number.isFinite(totalNetCents) || totalNetCents <= 0) {
@@ -81,8 +123,11 @@ module.exports = async (req, res) => {
     const amountValue = toEurString(totalNetCents);
 
     const payment = await mollie.payments.create({
-      amount: { currency: "EUR", value: amountValue },
-      description: `Boxplanet Direktkauf (${normalizedItems.length} Position(en))`,
+      amount: {
+        currency: "EUR",
+        value: amountValue,
+      },
+      description: `Boxplanet Direktkauf`,
       redirectUrl:
         process.env.MOLLIE_REDIRECT_URL ||
         "https://boxplanet.shop/checkout/success",
@@ -99,26 +144,29 @@ module.exports = async (req, res) => {
           city,
           country,
         },
-        items: normalizedItems.map((it) => ({
-          productOption: it.option,
-          quantity: it.qty,
-          name: PRODUCT_CATALOG[it.option].name,
-          unitPriceNet: toEurString(PRODUCT_CATALOG[it.option].unitPriceNetCents),
-        })),
+        items: normalizedItems,
         totalNet: amountValue,
       },
     });
 
-    const checkoutUrl = payment && payment.getCheckoutUrl && payment.getCheckoutUrl();
+    const checkoutUrl =
+      payment && payment.getCheckoutUrl && payment.getCheckoutUrl();
+
     if (!checkoutUrl) {
       res.statusCode = 500;
       return res.json({ error: "No checkoutUrl returned by Mollie" });
     }
 
-    return res.json({ checkoutUrl, paymentId: payment.id });
-  } catch (e) {
-    console.error("CREATE_ORDER_ERROR:", e);
+    return res.json({
+      checkoutUrl,
+      paymentId: payment.id,
+    });
+  } catch (error) {
+    console.error("CREATE_ORDER_ERROR:", error);
     res.statusCode = 500;
-    return res.json({ error: "create-order failed", details: e?.message || String(e) });
+    return res.json({
+      error: "create-order failed",
+      details: error?.message || String(error),
+    });
   }
 };
