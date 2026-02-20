@@ -1,10 +1,8 @@
 const createMollieClient = require("@mollie/api-client").default;
 
-const clampMoney = (v) => {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  if (n > 100000) return null; // Sicherheitsdeckel
-  return Math.round(n * 100) / 100; // 2 Dezimalstellen
+const PRODUCT_CATALOG = {
+  coin: { name: "Münzzähler", net: 1660.0 },
+  cash: { name: "Münz & Scheinzähler", net: 1890.0 },
 };
 
 const clampQuantity = (q) => {
@@ -13,7 +11,28 @@ const clampQuantity = (q) => {
   return Math.min(Math.floor(n), 50);
 };
 
-const toEur = (value) => Number(value).toFixed(2);
+const to2 = (n) => (Math.round(Number(n) * 100) / 100).toFixed(2);
+
+const calcLine = ({ productOption, quantity, vatRate }) => {
+  const p = PRODUCT_CATALOG[productOption];
+  const qty = clampQuantity(quantity);
+
+  const netTotal = p.net * qty;
+  const grossTotal = netTotal * (1 + vatRate / 100);
+  const vatAmount = grossTotal - netTotal;
+
+  // Mollie Orders API erwartet Strings mit 2 Nachkommastellen
+  return {
+    name: p.name,
+    quantity: qty,
+    unitPrice: { currency: "EUR", value: to2(p.net * (1 + vatRate / 100)) }, // BRUTTO je Stück
+    totalAmount: { currency: "EUR", value: to2(grossTotal) },               // BRUTTO gesamt
+    vatRate: to2(vatRate),
+    vatAmount: { currency: "EUR", value: to2(vatAmount) },
+    category: "physical",
+    sku: productOption,
+  };
+};
 
 module.exports = async (req, res) => {
   // CORS für Lovable
@@ -25,7 +44,6 @@ module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // Mollie Key (Vercel)
     const apiKey = process.env.MOLLIE_LIVE_KEY || process.env.MOLLIE_TEST_KEY;
     if (!apiKey) {
       return res.status(500).json({
@@ -53,20 +71,14 @@ module.exports = async (req, res) => {
       postalCode,
       city,
       country = "DE",
-
-      totalNet, // NETTO Gesamtwert vom Frontend
       vatRate = 19,
 
-      cart = [], // optional: für Bestellbestätigung (Produkte + Mengen)
+      // Lovable soll cart mitsenden (für Klarna/Orderlines + Mail)
+      cart = [],
     } = body;
 
-    if (!firstName || !lastName || !email) {
-      return res.status(400).json({ error: "Missing customer fields" });
-    }
-
-    const net = clampMoney(totalNet);
-    if (net === null) {
-      return res.status(400).json({ error: "Invalid totalNet" });
+    if (!firstName || !lastName || !email || !streetAndNumber || !postalCode || !city) {
+      return res.status(400).json({ error: "Missing required customer/address fields" });
     }
 
     const rate = Number(vatRate);
@@ -74,62 +86,90 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Invalid vatRate" });
     }
 
-    // BRUTTO berechnen (19% drauf)
-    const gross = Math.round(net * (1 + rate / 100) * 100) / 100;
-
-    // cart normalisieren (nur für E-Mail/Metadata; Betrag kommt aus totalNet)
     const normalizedCart = Array.isArray(cart)
       ? cart
           .map((i) => ({
             productOption: String(i.productOption || "").trim(),
             quantity: clampQuantity(i.quantity),
           }))
-          .filter((i) => i.productOption && i.quantity > 0)
+          .filter((i) => i.productOption && PRODUCT_CATALOG[i.productOption] && i.quantity > 0)
       : [];
+
+    if (normalizedCart.length === 0) {
+      return res.status(400).json({ error: "Cart is empty or invalid" });
+    }
+
+    // Lines + Totals aus cart berechnen (serverseitig korrekt, keine Frontend-Abweichung)
+    const lines = normalizedCart.map((it) => calcLine({ ...it, vatRate: rate }));
+
+    const totalGross = lines.reduce((sum, l) => sum + Number(l.totalAmount.value), 0);
+    const totalNet = normalizedCart.reduce((sum, it) => sum + PRODUCT_CATALOG[it.productOption].net * it.quantity, 0);
 
     const mollie = createMollieClient({ apiKey });
 
-    const payment = await mollie.payments.create({
-      amount: {
-        currency: "EUR",
-        value: toEur(gross), // BRUTTO an Mollie
+    // ✅ Klarna zuverlässig: Orders + vollständige Adresse + Lines
+    // Methode: "klarna" (neuer, einheitlicher Klarna-Checkout – Raten/Pay later je nach Klarna-Optionen im Checkout)
+    const order = await mollie.orders.create({
+      amount: { currency: "EUR", value: to2(totalGross) },
+      orderNumber: `BP-${Date.now()}`,
+      locale: "de_DE",
+      method: ["klarna", "card"],
+
+      billingAddress: {
+        givenName: firstName,
+        familyName: lastName,
+        email,
+        streetAndNumber,
+        postalCode,
+        city,
+        country,
       },
-      description: "Boxplanet Direktkauf",
+
+      shippingAddress: {
+        givenName: firstName,
+        familyName: lastName,
+        email,
+        streetAndNumber,
+        postalCode,
+        city,
+        country,
+      },
+
+      lines,
+
       redirectUrl: process.env.MOLLIE_REDIRECT_URL || "https://boxplanet.shop/checkout/success",
       webhookUrl: process.env.MOLLIE_WEBHOOK_URL || "https://boxplanet.vercel.app/api/mollie-webhook",
+
       metadata: {
         firstName,
         lastName,
         email,
-        streetAndNumber: streetAndNumber || "",
-        postalCode: postalCode || "",
-        city: city || "",
-        country: country || "DE",
-        totalNet: toEur(net),
+        streetAndNumber,
+        postalCode,
+        city,
+        country,
         vatRate: rate,
-        totalGross: toEur(gross),
-        cart: normalizedCart, // <-- Produkte + Mengen für Bestellbestätigung
+        totalNet: to2(totalNet),
+        totalGross: to2(totalGross),
+        cart: normalizedCart,
       },
     });
 
-    const checkoutUrl =
-      (payment.getCheckoutUrl && payment.getCheckoutUrl()) ||
-      payment?._links?.checkout?.href;
-
+    const checkoutUrl = order?._links?.checkout?.href;
     if (!checkoutUrl) {
-      return res.status(500).json({ error: "No checkout URL returned by Mollie" });
+      return res.status(500).json({ error: "No checkout URL returned by Mollie (order)" });
     }
 
     return res.json({
       checkoutUrl,
-      paymentId: payment.id,
-      totalNet: toEur(net),
-      totalGross: toEur(gross),
+      orderId: order.id,
+      totalNet: to2(totalNet),
+      totalGross: to2(totalGross),
     });
   } catch (err) {
     console.error("CREATE_ORDER_ERROR:", err);
     return res.status(500).json({
-      error: "Payment creation failed",
+      error: "Order creation failed",
       details: err?.message || String(err),
     });
   }
