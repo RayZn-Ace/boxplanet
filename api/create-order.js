@@ -59,7 +59,22 @@ module.exports = async (req, res) => {
       apiKey: process.env.MOLLIE_API_KEY,
     });
 
-    const body = req.body || {};
+    let body = req.body;
+
+// Vercel Functions liefern body manchmal als String (oder gar nicht geparsed)
+if (typeof body === "string") {
+  try {
+    body = JSON.parse(body);
+  } catch (e) {
+    body = {};
+  }
+}
+
+body = body || {};
+
+// Debug: sehen, ob POST überhaupt ankommt
+console.log("CREATE_ORDER_METHOD:", req.method);
+console.log("CREATE_ORDER_BODY:", body);
 
     const {
       firstName,
