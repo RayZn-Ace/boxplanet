@@ -2,10 +2,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
 
   const isProd = process.env.VERCEL_ENV === "production";
-
-  const mollieKey = isProd
-    ? process.env.MOLLIE_LIVE_KEY
-    : process.env.MOLLIE_TEST_KEY;
+  const mollieKey = isProd ? process.env.MOLLIE_LIVE_KEY : process.env.MOLLIE_TEST_KEY;
 
   const resendKey = process.env.RESEND_API_KEY;
   const notifyEmail = process.env.NOTIFY_EMAIL;
@@ -28,64 +25,96 @@ export default async function handler(req, res) {
     return ok();
   }
 
-  // Mollie sendet meistens x-www-form-urlencoded: id=ord_xxx
+  // Mollie sendet meist x-www-form-urlencoded: id=tr_xxx
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString("utf8");
   const params = new URLSearchParams(raw);
 
-  const orderId = params.get("id");
-  if (!orderId) {
-    console.log("Webhook: No order id in payload");
+  const paymentId = params.get("id");
+  if (!paymentId) {
+    console.log("Webhook: No id in payload");
+    return ok();
+  }
+
+  // Nur Payments in diesem Setup
+  if (!paymentId.startsWith("tr_")) {
+    console.log("Webhook: Ignored non-payment id", { paymentId });
     return ok();
   }
 
   try {
-    // Order-Status sicher bei Mollie nachschlagen
-    const r = await fetch(`https://api.mollie.com/v2/orders/${orderId}`, {
+    // Payment sicher bei Mollie nachschlagen
+    const r = await fetch(`https://api.mollie.com/v2/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${mollieKey}` }
     });
 
-    const order = await r.json();
+    const payment = await r.json();
 
     if (!r.ok) {
-      console.log("Webhook: Mollie fetch error", order);
+      console.log("Webhook: Mollie fetch error", payment);
       return ok();
     }
 
-    const status = order?.status;
-    const amount = order?.amount?.value
-      ? `${order.amount.value} ${order.amount.currency}`
+    const status = payment?.status; // paid / open / failed / etc.
+    const amount = payment?.amount?.value
+      ? `${payment.amount.value} ${payment.amount.currency}`
       : "-";
 
     // ✅ Nur bei bestätigter Zahlung mailen
-    const isConfirmed = status === "paid" || status === "completed";
-    if (!isConfirmed) return ok();
+    if (status !== "paid") return ok();
 
-    const email = order?.metadata?.email || "-";
-    const productOption = order?.metadata?.productOption || "-";
-    const net = order?.metadata?.net;
-    const gross = order?.metadata?.gross;
+    const md = payment?.metadata || {};
+    const customerEmail = md?.email || "";
+    const fullName = [md?.firstName, md?.lastName].filter(Boolean).join(" ").trim() || "Kunde";
 
-    const subject = `✅ Zahlung eingegangen (${isProd ? "LIVE" : "TEST"}): ${productOption} (${amount})`;
+    const totalNet = md?.totalNet || "-";
+    const totalGross = md?.totalGross || payment?.amount?.value || "-";
+    const vatRate = md?.vatRate ?? 19;
 
-    const text = [
+    const addressLine = [md?.streetAndNumber, md?.postalCode, md?.city]
+      .filter(Boolean)
+      .join(", ");
+
+    // Produkte & Mengen (aus metadata.cart)
+    const cart = Array.isArray(md?.cart) ? md.cart : [];
+    const niceName = (opt) => {
+      if (opt === "coin") return "Münzzähler";
+      if (opt === "cash") return "Münz & Scheinzähler";
+      return opt || "-";
+    };
+
+    const productLines = cart.length
+      ? cart.map((i) => `- ${i.quantity} x ${niceName(i.productOption)}`).join("\n")
+      : "- (keine Positionsdaten übermittelt)";
+
+    // -----------------
+    // ADMIN MAIL
+    // -----------------
+    const adminSubject = `✅ Zahlung eingegangen (${isProd ? "LIVE" : "TEST"}): ${amount}`;
+    const adminText = [
       "Zahlung ist eingegangen.",
       "",
       `ENV: ${isProd ? "LIVE" : "TEST"}`,
-      `Order ID: ${orderId}`,
+      `Payment ID: ${paymentId}`,
       `Status: ${status}`,
-      `Betrag: ${amount}`,
-      gross ? `Brutto (berechnet): ${gross} EUR` : null,
-      net ? `Netto (Auswahl): ${net} EUR` : null,
-      `Produkt-Option: ${productOption}`,
-      `Kunden-E-Mail: ${email}`,
+      `Betrag (Mollie): ${amount}`,
+      "",
+      "Produkte:",
+      productLines,
+      "",
+      `Netto: ${totalNet} EUR`,
+      `MwSt: ${vatRate}%`,
+      `Brutto: ${totalGross} EUR`,
+      "",
+      `Kunde: ${fullName}`,
+      `Kunden-E-Mail: ${customerEmail || "-"}`,
+      addressLine ? `Adresse: ${addressLine}` : null,
       "",
       "Hinweis: Mollie kann Webhooks mehrfach senden. Wenn du doppelte Mails bekommst, sag Bescheid – dann baue ich eine Duplikatsperre."
     ].filter(Boolean).join("\n");
 
-    // Mail senden via Resend
-    const rr = await fetch("https://api.resend.com/emails", {
+    const rrAdmin = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${resendKey}`,
@@ -94,19 +123,68 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         from: fromEmail,
         to: [notifyEmail],
-        subject,
-        text
+        subject: adminSubject,
+        text: adminText
       })
     });
 
-    const rrData = await rr.json();
-
-    if (!rr.ok) {
-      console.log("Webhook: Resend error", rrData);
+    const rrAdminData = await rrAdmin.json();
+    if (!rrAdmin.ok) {
+      console.log("Webhook: Resend admin error", rrAdminData);
       return ok();
     }
 
-    console.log("Webhook: Mail sent", rrData);
+    // -----------------
+    // CUSTOMER MAIL
+    // -----------------
+    if (customerEmail && customerEmail.includes("@")) {
+      const customerSubject = "✅ Bestellbestätigung – Boxplanet Direktkauf";
+      const customerText = [
+        `Hallo ${fullName},`,
+        "",
+        "vielen Dank! Wir haben deine Zahlung erfolgreich erhalten.",
+        "",
+        "Deine Bestellung:",
+        productLines,
+        "",
+        `Netto: ${totalNet} EUR`,
+        `MwSt: ${vatRate}%`,
+        `Brutto: ${totalGross} EUR`,
+        "",
+        `Payment ID: ${paymentId}`,
+        addressLine ? `Adresse: ${addressLine}` : null,
+        "",
+        "Wenn du Fragen hast, antworte einfach auf diese E-Mail.",
+        "",
+        "Mit freundlichen Grüßen",
+        "Boxplanet"
+      ].filter(Boolean).join("\n");
+
+      const rrCustomer = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${resendKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          from: fromEmail,
+          to: [customerEmail],
+          subject: customerSubject,
+          text: customerText
+        })
+      });
+
+      const rrCustomerData = await rrCustomer.json();
+      if (!rrCustomer.ok) {
+        console.log("Webhook: Resend customer error", rrCustomerData);
+        return ok();
+      }
+
+      console.log("Webhook: Admin+Customer mail sent", { rrAdminData, rrCustomerData });
+      return ok();
+    }
+
+    console.log("Webhook: Admin mail sent, customer email missing/invalid", rrAdminData);
     return ok();
   } catch (err) {
     console.log("Webhook: Server error", String(err));
