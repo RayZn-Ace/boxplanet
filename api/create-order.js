@@ -1,17 +1,14 @@
 const createMollieClient = require("@mollie/api-client").default;
 
-const PRODUCT_CATALOG = {
-  coin: { name: "Münzzähler", priceCents: 1660 * 100 },
-  cash: { name: "Münz & Scheinzähler", priceCents: 1890 * 100 },
+const clampMoney = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // max 100.000€ als Schutz
+  if (n > 100000) return null;
+  return Math.round(n * 100) / 100; // 2 decimals
 };
 
-const clampQuantity = (q) => {
-  const n = Number(q);
-  if (!Number.isFinite(n) || n < 1) return 1;
-  return Math.min(Math.floor(n), 50);
-};
-
-const toEur = (cents) => (cents / 100).toFixed(2);
+const toEur = (value) => Number(value).toFixed(2);
 
 module.exports = async (req, res) => {
   // CORS für Lovable
@@ -24,22 +21,15 @@ module.exports = async (req, res) => {
 
   try {
     const apiKey = process.env.MOLLIE_LIVE_KEY || process.env.MOLLIE_TEST_KEY;
-
     if (!apiKey) {
-      return res.status(500).json({
-        error: "No Mollie key found",
-        hint: "Check MOLLIE_LIVE_KEY or MOLLIE_TEST_KEY in Vercel",
-      });
+      return res.status(500).json({ error: "No Mollie key found (MOLLIE_LIVE_KEY / MOLLIE_TEST_KEY)" });
     }
 
-    // Body robust parsen
+    // Body parse
     let body = req.body;
     if (typeof body === "string") {
-      try {
-        body = JSON.parse(body);
-      } catch {
-        return res.status(400).json({ error: "Invalid JSON body" });
-      }
+      try { body = JSON.parse(body); }
+      catch { return res.status(400).json({ error: "Invalid JSON body" }); }
     }
     body = body || {};
 
@@ -47,60 +37,32 @@ module.exports = async (req, res) => {
       firstName,
       lastName,
       email,
-      productOption,
-      quantity,
-      cart, // <-- NEU
+      totalNet,   // <-- NETTO Gesamtbetrag vom Frontend (z.B. 7330.00)
+      vatRate = 19
     } = body;
 
     if (!firstName || !lastName || !email) {
       return res.status(400).json({ error: "Missing customer fields" });
     }
 
-    // -------------------------
-    // CART LOGIK (NEU)
-    // -------------------------
-    // Wenn cart vorhanden ist: nutze cart
-    // sonst: fallback auf productOption + quantity (wie vorher)
-    const normalizedItems = [];
-
-    if (Array.isArray(cart) && cart.length > 0) {
-      for (const item of cart) {
-        const option = String(item.productOption || "").trim();
-        if (!option || !PRODUCT_CATALOG[option]) continue;
-
-        normalizedItems.push({
-          productOption: option,
-          quantity: clampQuantity(item.quantity),
-        });
-      }
-    } else {
-      const option = String(productOption || "").trim();
-      if (!option || !PRODUCT_CATALOG[option]) {
-        return res.status(400).json({ error: "Invalid productOption" });
-      }
-
-      normalizedItems.push({
-        productOption: option,
-        quantity: clampQuantity(quantity),
-      });
+    const net = clampMoney(totalNet);
+    if (net === null) {
+      return res.status(400).json({ error: "Invalid totalNet" });
     }
 
-    if (normalizedItems.length === 0) {
-      return res.status(400).json({ error: "No valid cart items" });
+    const rate = Number(vatRate);
+    if (!Number.isFinite(rate) || rate < 0 || rate > 30) {
+      return res.status(400).json({ error: "Invalid vatRate" });
     }
 
-    // Gesamtpreis berechnen (Summe aller Items)
-    const totalCents = normalizedItems.reduce((sum, it) => {
-      const p = PRODUCT_CATALOG[it.productOption];
-      return sum + p.priceCents * it.quantity;
-    }, 0);
+    const gross = Math.round(net * (1 + rate / 100) * 100) / 100;
 
     const mollie = createMollieClient({ apiKey });
 
     const payment = await mollie.payments.create({
       amount: {
         currency: "EUR",
-        value: toEur(totalCents),
+        value: toEur(gross), // <-- BRUTTO an Mollie
       },
       description: "Boxplanet Direktkauf",
       redirectUrl: "https://boxplanet.shop/checkout/success",
@@ -109,13 +71,9 @@ module.exports = async (req, res) => {
         firstName,
         lastName,
         email,
-        cart: normalizedItems.map((it) => ({
-          productOption: it.productOption,
-          quantity: it.quantity,
-          name: PRODUCT_CATALOG[it.productOption].name,
-          unitPrice: toEur(PRODUCT_CATALOG[it.productOption].priceCents),
-        })),
-        total: toEur(totalCents),
+        totalNet: toEur(net),
+        vatRate: rate,
+        totalGross: toEur(gross),
       },
     });
 
@@ -124,13 +82,14 @@ module.exports = async (req, res) => {
       payment?._links?.checkout?.href;
 
     if (!checkoutUrl) {
-      return res.status(500).json({ error: "No checkout URL returned" });
+      return res.status(500).json({ error: "No checkout URL returned by Mollie" });
     }
 
     return res.json({
       checkoutUrl,
       paymentId: payment.id,
-      total: toEur(totalCents),
+      totalNet: toEur(net),
+      totalGross: toEur(gross),
     });
   } catch (err) {
     console.error("CREATE_ORDER_ERROR:", err);
