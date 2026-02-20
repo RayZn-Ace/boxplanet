@@ -114,8 +114,8 @@ module.exports = async (req, res) => {
 
     const mollie = createMollieClient({ apiKey });
 
-    // Base Order Payload
-    const baseOrderPayload = {
+    // ✅ KEIN "method" setzen → Mollie zeigt alle verfügbaren Methoden (inkl. Klarna, Karte, Apple Pay, etc.)
+    const order = await mollie.orders.create({
       amount: { currency: "EUR", value: to2(totalGross) },
       orderNumber: `BP-${Date.now()}`,
       locale: "de_DE",
@@ -156,54 +156,10 @@ module.exports = async (req, res) => {
         cart: normalizedCart,
         totalGross: to2(totalGross),
       },
-    };
-
-    // 1) Versuch: Klarna-Methoden (je nach Account heißen sie unterschiedlich)
-    // Falls Mollie das ablehnt => Fallback ohne method.
-    const klarnaMethodCandidates = [
-      ["klarna"], // manche Accounts
-      ["klarnapaylater", "klarnapaynow", "klarnasliceit"], // ältere Varianten (wenn verfügbar)
-      ["paylater"], // selten
-    ];
-
-    let order = null;
-    let lastMethodError = null;
-
-    for (const methods of klarnaMethodCandidates) {
-      try {
-        order = await mollie.orders.create({
-          ...baseOrderPayload,
-          method: methods,
-        });
-        break;
-      } catch (e) {
-        lastMethodError = e;
-      }
-    }
-
-    // 2) Wenn alles fehlschlägt: ohne method (Checkout funktioniert immer)
-    if (!order) {
-      try {
-        order = await mollie.orders.create(baseOrderPayload);
-      } catch (e) {
-        console.error("Mollie order create failed:", e);
-        return res.status(500).json({
-          error: "Mollie order create failed",
-          message: e.message,
-          field: e.field,
-          statusCode: e.statusCode,
-          title: e.title,
-          lastMethodError: lastMethodError ? {
-            message: lastMethodError.message,
-            field: lastMethodError.field,
-            statusCode: lastMethodError.statusCode,
-            title: lastMethodError.title,
-          } : null,
-        });
-      }
-    }
+    });
 
     const checkoutUrl = order?._links?.checkout?.href;
+
     if (!checkoutUrl) {
       return res.status(500).json({
         error: "No checkout URL returned",
@@ -215,8 +171,6 @@ module.exports = async (req, res) => {
       checkoutUrl,
       orderId: order.id,
       totalGross: to2(totalGross),
-      // Debug-Hinweis: ob Klarna erzwungen wurde oder Fallback
-      methodMode: order?._links ? "ok" : "unknown",
     });
   } catch (err) {
     console.error("SERVER ERROR:", err);
