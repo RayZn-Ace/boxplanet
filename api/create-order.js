@@ -23,18 +23,16 @@ module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    // 🔥 HIER DER FIX
-    const apiKey =
-      process.env.MOLLIE_LIVE_KEY ||
-      process.env.MOLLIE_TEST_KEY;
+    const apiKey = process.env.MOLLIE_LIVE_KEY || process.env.MOLLIE_TEST_KEY;
 
     if (!apiKey) {
       return res.status(500).json({
         error: "No Mollie key found",
-        hint: "Check MOLLIE_LIVE_KEY or MOLLIE_TEST_KEY in Vercel"
+        hint: "Check MOLLIE_LIVE_KEY or MOLLIE_TEST_KEY in Vercel",
       });
     }
 
+    // Body robust parsen
     let body = req.body;
     if (typeof body === "string") {
       try {
@@ -43,19 +41,59 @@ module.exports = async (req, res) => {
         return res.status(400).json({ error: "Invalid JSON body" });
       }
     }
+    body = body || {};
 
-    const { firstName, lastName, email, productOption, quantity } = body || {};
+    const {
+      firstName,
+      lastName,
+      email,
+      productOption,
+      quantity,
+      cart, // <-- NEU
+    } = body;
 
     if (!firstName || !lastName || !email) {
       return res.status(400).json({ error: "Missing customer fields" });
     }
 
-    if (!PRODUCT_CATALOG[productOption]) {
-      return res.status(400).json({ error: "Invalid productOption" });
+    // -------------------------
+    // CART LOGIK (NEU)
+    // -------------------------
+    // Wenn cart vorhanden ist: nutze cart
+    // sonst: fallback auf productOption + quantity (wie vorher)
+    const normalizedItems = [];
+
+    if (Array.isArray(cart) && cart.length > 0) {
+      for (const item of cart) {
+        const option = String(item.productOption || "").trim();
+        if (!option || !PRODUCT_CATALOG[option]) continue;
+
+        normalizedItems.push({
+          productOption: option,
+          quantity: clampQuantity(item.quantity),
+        });
+      }
+    } else {
+      const option = String(productOption || "").trim();
+      if (!option || !PRODUCT_CATALOG[option]) {
+        return res.status(400).json({ error: "Invalid productOption" });
+      }
+
+      normalizedItems.push({
+        productOption: option,
+        quantity: clampQuantity(quantity),
+      });
     }
 
-    const qty = clampQuantity(quantity);
-    const totalCents = PRODUCT_CATALOG[productOption].priceCents * qty;
+    if (normalizedItems.length === 0) {
+      return res.status(400).json({ error: "No valid cart items" });
+    }
+
+    // Gesamtpreis berechnen (Summe aller Items)
+    const totalCents = normalizedItems.reduce((sum, it) => {
+      const p = PRODUCT_CATALOG[it.productOption];
+      return sum + p.priceCents * it.quantity;
+    }, 0);
 
     const mollie = createMollieClient({ apiKey });
 
@@ -71,8 +109,13 @@ module.exports = async (req, res) => {
         firstName,
         lastName,
         email,
-        productOption,
-        quantity: qty,
+        cart: normalizedItems.map((it) => ({
+          productOption: it.productOption,
+          quantity: it.quantity,
+          name: PRODUCT_CATALOG[it.productOption].name,
+          unitPrice: toEur(PRODUCT_CATALOG[it.productOption].priceCents),
+        })),
+        total: toEur(totalCents),
       },
     });
 
@@ -87,13 +130,13 @@ module.exports = async (req, res) => {
     return res.json({
       checkoutUrl,
       paymentId: payment.id,
+      total: toEur(totalCents),
     });
-
   } catch (err) {
     console.error("CREATE_ORDER_ERROR:", err);
     return res.status(500).json({
       error: "Payment creation failed",
-      details: err.message,
+      details: err?.message || String(err),
     });
   }
 };
