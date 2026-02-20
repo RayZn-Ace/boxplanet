@@ -14,43 +14,37 @@ const clampQuantity = (q) => {
 const toEur = (cents) => (cents / 100).toFixed(2);
 
 module.exports = async (req, res) => {
-  /* =========================
-     CORS (für Lovable)
-  ========================== */
+  // CORS für Lovable
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    if (!process.env.MOLLIE_API_KEY) {
-      return res.status(500).json({ error: "Missing MOLLIE_API_KEY" });
-    }
+    // 🔥 HIER DER FIX
+    const apiKey =
+      process.env.MOLLIE_LIVE_KEY ||
+      process.env.MOLLIE_TEST_KEY;
 
-    const mollie = createMollieClient({
-      apiKey: process.env.MOLLIE_API_KEY,
-    });
+    if (!apiKey) {
+      return res.status(500).json({
+        error: "No Mollie key found",
+        hint: "Check MOLLIE_LIVE_KEY or MOLLIE_TEST_KEY in Vercel"
+      });
+    }
 
     let body = req.body;
-
     if (typeof body === "string") {
-      body = JSON.parse(body);
+      try {
+        body = JSON.parse(body);
+      } catch {
+        return res.status(400).json({ error: "Invalid JSON body" });
+      }
     }
 
-    const {
-      firstName,
-      lastName,
-      email,
-      productOption,
-      quantity
-    } = body || {};
+    const { firstName, lastName, email, productOption, quantity } = body || {};
 
     if (!firstName || !lastName || !email) {
       return res.status(400).json({ error: "Missing customer fields" });
@@ -62,6 +56,8 @@ module.exports = async (req, res) => {
 
     const qty = clampQuantity(quantity);
     const totalCents = PRODUCT_CATALOG[productOption].priceCents * qty;
+
+    const mollie = createMollieClient({ apiKey });
 
     const payment = await mollie.payments.create({
       amount: {
@@ -80,13 +76,21 @@ module.exports = async (req, res) => {
       },
     });
 
+    const checkoutUrl =
+      (payment.getCheckoutUrl && payment.getCheckoutUrl()) ||
+      payment?._links?.checkout?.href;
+
+    if (!checkoutUrl) {
+      return res.status(500).json({ error: "No checkout URL returned" });
+    }
+
     return res.json({
-      checkoutUrl: payment.getCheckoutUrl(),
+      checkoutUrl,
       paymentId: payment.id,
     });
 
   } catch (err) {
-    console.error("ERROR:", err);
+    console.error("CREATE_ORDER_ERROR:", err);
     return res.status(500).json({
       error: "Payment creation failed",
       details: err.message,
