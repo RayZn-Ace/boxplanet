@@ -99,12 +99,17 @@ module.exports = async (req, res) => {
     }
 
     const rate = Number(vatRate);
-    if (!Number.isFinite(rate)) {
+    if (!Number.isFinite(rate) || rate < 0 || rate > 30) {
       return res.status(400).json({
         error: "Invalid VAT rate",
         received: body,
       });
     }
+
+    // ✅ Mollie erlaubt NUR diese Kategorien bei Orders:
+    // "meal", "gift", "eco", "sport_culture", "holiday"
+    // Für Boxautomaten ist "gift" der beste generische Fit.
+    const ORDER_LINE_CATEGORY = "gift";
 
     const lines = normalizedCart.map((item) => {
       const product = PRODUCT_CATALOG[item.productOption];
@@ -128,7 +133,7 @@ module.exports = async (req, res) => {
           currency: "EUR",
           value: to2(vatAmount),
         },
-        category: "physical",
+        category: ORDER_LINE_CATEGORY, // ✅ FIX
         sku: item.productOption,
       };
     });
@@ -144,7 +149,10 @@ module.exports = async (req, res) => {
       amount: { currency: "EUR", value: to2(totalGross) },
       orderNumber: `BP-${Date.now()}`,
       locale: "de_DE",
+
+      // Klarna + Karte (Klarna zeigt dann die möglichen Optionen inkl. Raten/Pay Later je nach Verfügbarkeit)
       method: ["klarna", "card"],
+
       billingAddress: {
         givenName: firstName,
         familyName: lastName,
@@ -163,13 +171,16 @@ module.exports = async (req, res) => {
         city,
         country,
       },
+
       lines,
+
       redirectUrl:
         process.env.MOLLIE_REDIRECT_URL ||
         "https://boxplanet.shop/checkout/success",
       webhookUrl:
         process.env.MOLLIE_WEBHOOK_URL ||
         "https://boxplanet.vercel.app/api/mollie-webhook",
+
       metadata: {
         firstName,
         lastName,
@@ -180,6 +191,7 @@ module.exports = async (req, res) => {
         country,
         vatRate: rate,
         cart: normalizedCart,
+        totalGross: to2(totalGross),
       },
     });
 
@@ -202,7 +214,10 @@ module.exports = async (req, res) => {
     return res.status(500).json({
       error: "Internal Server Error",
       message: err.message,
-      stack: err.stack,
+      // Mollie ApiError hat oft hilfreiche Felder:
+      field: err.field,
+      statusCode: err.statusCode,
+      title: err.title,
     });
   }
 };
