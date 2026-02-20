@@ -1,5 +1,8 @@
 {
   "name": "boxplanet-mollie-api",
   "private": true,
-  "version": "1.0.0"
+  "version": "1.0.0",
+  "dependencies": {
+    "@mollie/api-client": "^3.7.0"
+  }
 }
